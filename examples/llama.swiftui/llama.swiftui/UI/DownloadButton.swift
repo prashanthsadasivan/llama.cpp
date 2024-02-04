@@ -1,20 +1,79 @@
 import SwiftUI
+import Foundation
+import Combine
 
 struct DownloadButton: View {
+    class DownloadState : ObservableObject {
+        @Published var status: String = ""
+        @Published  var progress = 0.0
+        @Published var model: Model?
+        var downloadTask: URLSessionDownloadTask?
+        var progressObserver: AnyCancellable?
+
+        static func withStatus(_ status: String) -> DownloadState {
+            return DownloadState(status: status)
+        }
+
+        init(status: String, downloadTask: URLSessionDownloadTask? = nil, progress: Double = 0.0, model: Model? = nil, progressObserver: AnyCancellable? = nil) {
+            self.status = status
+            self.downloadTask = downloadTask
+            self.progress = progress
+            self.model = model
+            self.progressObserver = progressObserver
+        }
+
+        static func getFileURL(filename: String) -> URL {
+            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(filename)
+        }
+
+        func download(modelName: String, modelUrl: String, filename: String) {
+            status = "downloading"
+            print("Downloading model \(modelName) from \(modelUrl)")
+            guard let url = URL(string: modelUrl) else { return }
+            let fileURL = DownloadState.getFileURL(filename: filename)
+
+            downloadTask = URLSession.shared.downloadTask(with: url) { temporaryURL, response, error in
+                if  let error = error {
+                    print("Error: \(error.localizedDescription)")
+                    return
+                }
+
+                guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else {
+                    print("Server error!")
+                    return
+                }
+
+                do {
+                    if let temporaryURL = temporaryURL {
+                        try FileManager.default.copyItem(at: temporaryURL, to: fileURL)
+                        print("Writing to \(filename) completed")
+                        DispatchQueue.main.async {
+                            self.model =  Model(name: modelName, url: modelUrl, filename: filename, status: "downloaded")
+                            self.status = "downloaded"
+                        }
+                    }
+                } catch  {
+                    // Handle the error locally, for example, by logging it or updating the state
+                    print("Error occurred: \(error)")
+                    // Optionally, update some state or perform other non-throwing actions
+                }
+            }
+
+            self.progressObserver = downloadTask?.progress
+                .publisher(for: \.fractionCompleted).receive(on: DispatchQueue.main)
+                .sink { [weak self] fractionCompleted in
+                    self?.progress = fractionCompleted
+                }
+
+            downloadTask?.resume()
+        }
+    }
+
+    @StateObject var downloadState: DownloadState
     @ObservedObject private var llamaState: LlamaState
     private var modelName: String
     private var modelUrl: String
     private var filename: String
-
-    @State private var status: String
-
-    @State private var downloadTask: URLSessionDownloadTask?
-    @State private var progress = 0.0
-    @State private var observation: NSKeyValueObservation?
-
-    private static func getFileURL(filename: String) -> URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(filename)
-    }
 
     private func checkFileExistenceAndUpdateStatus() {
     }
@@ -24,69 +83,31 @@ struct DownloadButton: View {
         self.modelName = modelName
         self.modelUrl = modelUrl
         self.filename = filename
-
-        let fileURL = DownloadButton.getFileURL(filename: filename)
-        status = FileManager.default.fileExists(atPath: fileURL.path) ? "downloaded" : "download"
-    }
-
-    private func download() {
-        status = "downloading"
-        print("Downloading model \(modelName) from \(modelUrl)")
-        guard let url = URL(string: modelUrl) else { return }
-        let fileURL = DownloadButton.getFileURL(filename: filename)
-
-        downloadTask = URLSession.shared.downloadTask(with: url) { temporaryURL, response, error in
-            if let error = error {
-                print("Error: \(error.localizedDescription)")
-                return
-            }
-
-            guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else {
-                print("Server error!")
-                return
-            }
-
-            do {
-                if let temporaryURL = temporaryURL {
-                    try FileManager.default.copyItem(at: temporaryURL, to: fileURL)
-                    print("Writing to \(filename) completed")
-
-                    llamaState.cacheCleared = false
-
-                    let model = Model(name: modelName, url: modelUrl, filename: filename, status: "downloaded")
-                    llamaState.downloadedModels.append(model)
-                    status = "downloaded"
-                }
-            } catch let err {
-                print("Error: \(err.localizedDescription)")
-            }
-        }
-
-        observation = downloadTask?.progress.observe(\.fractionCompleted) { progress, _ in
-            self.progress = progress.fractionCompleted
-        }
-
-        downloadTask?.resume()
+        let fileURL = DownloadState.getFileURL(filename: filename)
+        _downloadState = StateObject(wrappedValue: DownloadState.withStatus(FileManager.default.fileExists(atPath: fileURL.path) ? "downloaded" : "download"
+))
     }
 
     var body: some View {
         VStack {
-            if status == "download" {
-                Button(action: download) {
+            if downloadState.status == "download" {
+                Button(action: {
+                    downloadState.download(modelName: modelName, modelUrl: modelUrl, filename: filename)
+                }) {
                     Text("Download " + modelName)
                 }
-            } else if status == "downloading" {
+            } else if downloadState.status == "downloading" {
                 Button(action: {
-                    downloadTask?.cancel()
-                    status = "download"
+                    downloadState.downloadTask?.cancel()
+                    downloadState.status = "download"
                 }) {
-                    Text("\(modelName) (Downloading \(Int(progress * 100))%)")
+                    Text("\(modelName) (Downloading \(Int(downloadState.progress * 100))%)")
                 }
-            } else if status == "downloaded" {
+            } else if downloadState.status == "downloaded" {
                 Button(action: {
-                    let fileURL = DownloadButton.getFileURL(filename: filename)
+                    let fileURL = DownloadState.getFileURL(filename: filename)
                     if !FileManager.default.fileExists(atPath: fileURL.path) {
-                        download()
+                        downloadState.download(modelName: modelName, modelUrl: modelUrl, filename: filename)
                         return
                     }
                     do {
@@ -98,17 +119,17 @@ struct DownloadButton: View {
                     Text("Load \(modelName)")
                 }
             } else {
-                Text("Unknown status")
+                Text("Unknown status: \(downloadState.status)")
             }
         }
         .onDisappear() {
-            downloadTask?.cancel()
+            downloadState.downloadTask?.cancel()
         }
         .onChange(of: llamaState.cacheCleared) { newValue in
             if newValue {
-                downloadTask?.cancel()
-                let fileURL = DownloadButton.getFileURL(filename: filename)
-                status = FileManager.default.fileExists(atPath: fileURL.path) ? "downloaded" : "download"
+                downloadState.downloadTask?.cancel()
+                let fileURL = DownloadState.getFileURL(filename: filename)
+                downloadState.status = FileManager.default.fileExists(atPath: fileURL.path) ? "downloaded" : "download"
             }
         }
     }
